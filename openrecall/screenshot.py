@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 from openrecall.config import screenshots_path, args
-from openrecall.database import insert_entry
+from openrecall.database import insert_entry, upsert_monitor, get_enabled_monitors
 from openrecall.nlp import get_embedding
 from openrecall.ocr import extract_text_from_image
 from openrecall.utils import (
@@ -67,39 +67,71 @@ def is_similar(
     return similarity >= similarity_threshold
 
 
-def take_screenshots() -> List[np.ndarray]:
-    """Takes screenshots of all connected monitors or just the primary one.
+def enumerate_and_sync_monitors() -> None:
+    """
+    Enumerates all connected monitors and synchronizes them with the database.
 
-    Depending on the `args.primary_monitor_only` flag, captures either
-    all monitors or only the primary monitor (index 1 in mss.monitors).
+    For each detected monitor, creates or updates its entry in the monitors table
+    with current resolution information. New monitors are enabled by default.
+    """
+    with mss.mss() as sct:
+        # sct.monitors[0] is the combined view, skip it
+        # sct.monitors[1:] are individual monitors
+        for i in range(1, len(sct.monitors)):
+            monitor = sct.monitors[i]
+            width = monitor['width']
+            height = monitor['height']
+            name = f"Monitor {i}" if i == 1 else f"Monitor {i}"
+
+            # Upsert the monitor (will preserve enabled status if already exists)
+            upsert_monitor(
+                monitor_index=i,
+                name=name,
+                width=width,
+                height=height,
+                enabled=True  # Default to enabled for new monitors
+            )
+    print(f"Enumerated and synced {len(sct.monitors) - 1} monitors")
+
+
+def take_screenshots() -> List[Tuple[int, str, np.ndarray]]:
+    """Takes screenshots of enabled monitors based on database configuration.
 
     Returns:
-        A list of screenshots, where each screenshot is a NumPy array (RGB).
+        A list of tuples: (monitor_index, monitor_name, screenshot_array)
+        where screenshot_array is a NumPy array (RGB).
     """
-    screenshots: List[np.ndarray] = []
+    screenshots: List[Tuple[int, str, np.ndarray]] = []
+
+    # Get enabled monitors from database
+    enabled_monitors = get_enabled_monitors()
+
+    # If no monitors are configured yet, fall back to all monitors or primary only
+    if not enabled_monitors:
+        print("No monitors configured, using default behavior")
+        with mss.mss() as sct:
+            monitor_indices = [1] if args.primary_monitor_only else range(1, len(sct.monitors))
+
+            for i in monitor_indices:
+                if i < len(sct.monitors):
+                    monitor_info = sct.monitors[i]
+                    sct_img = sct.grab(monitor_info)
+                    screenshot = np.array(sct_img)[:, :, [2, 1, 0]]
+                    screenshots.append((i, f"Monitor {i}", screenshot))
+        return screenshots
+
+    # Take screenshots only from enabled monitors
     with mss.mss() as sct:
-        # sct.monitors[0] is the combined view of all monitors
-        # sct.monitors[1] is the primary monitor
-        # sct.monitors[2:] are other monitors
-        monitor_indices = range(1, len(sct.monitors))  # Skip the 'all monitors' entry
+        for monitor_config in enabled_monitors:
+            monitor_index = monitor_config.monitor_index
 
-        if args.primary_monitor_only:
-            monitor_indices = [1]  # Only index 1 corresponds to the primary monitor
-
-        for i in monitor_indices:
-            # Ensure the index is valid before attempting to grab
-            if i < len(sct.monitors):
-                monitor_info = sct.monitors[i]
-                # Grab the screen
+            if monitor_index < len(sct.monitors):
+                monitor_info = sct.monitors[monitor_index]
                 sct_img = sct.grab(monitor_info)
-                # Convert to numpy array and change BGRA to RGB
                 screenshot = np.array(sct_img)[:, :, [2, 1, 0]]
-                screenshots.append(screenshot)
+                screenshots.append((monitor_index, monitor_config.name, screenshot))
             else:
-                # Handle case where primary_monitor_only is True but only one monitor exists (all monitors view)
-                # This case might need specific handling depending on desired behavior.
-                # For now, we just skip if the index is out of bounds.
-                print(f"Warning: Monitor index {i} out of bounds. Skipping.")
+                print(f"Warning: Monitor {monitor_config.name} (index {monitor_index}) not found. Skipping.")
 
     return screenshots
 
@@ -117,89 +149,66 @@ def record_screenshots_thread() -> None:
     # when used in environments where multiprocessing fork safety is a concern.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    last_screenshots: List[np.ndarray] = take_screenshots()
+    # Enumerate and sync monitors on startup
+    enumerate_and_sync_monitors()
+
+    # Initialize last_screenshots with current screenshots
+    # Store as dict: {monitor_index: (monitor_name, screenshot_array)}
+    last_screenshots_dict = {}
+    initial_screenshots = take_screenshots()
+    for monitor_index, monitor_name, screenshot_array in initial_screenshots:
+        last_screenshots_dict[monitor_index] = (monitor_name, screenshot_array)
 
     while True:
         if not is_user_active():
             time.sleep(3)  # Wait longer if user is inactive
             continue
 
-        current_screenshots: List[np.ndarray] = take_screenshots()
+        current_screenshots = take_screenshots()
 
-        # Ensure we have a last_screenshot for each current_screenshot
-        # This handles cases where monitor setup might change (though unlikely mid-run)
-        if len(last_screenshots) != len(current_screenshots):
-             # If monitor count changes, reset last_screenshots and continue
-             last_screenshots = current_screenshots
-             time.sleep(3)
-             continue
+        for monitor_index, monitor_name, current_screenshot in current_screenshots:
+            # Get the last screenshot for this monitor if it exists
+            if monitor_index not in last_screenshots_dict:
+                # New monitor appeared, initialize it
+                last_screenshots_dict[monitor_index] = (monitor_name, current_screenshot)
+                continue
 
+            last_monitor_name, last_screenshot = last_screenshots_dict[monitor_index]
 
-        for i, current_screenshot in enumerate(current_screenshots):
-            last_screenshot = last_screenshots[i]
-
+            # Check if the screenshot has changed significantly
             if not is_similar(current_screenshot, last_screenshot):
-                last_screenshots[i] = current_screenshot  # Update the last screenshot for this monitor
+                # Update the last screenshot for this monitor
+                last_screenshots_dict[monitor_index] = (monitor_name, current_screenshot)
+
+                # Save the screenshot
                 image = Image.fromarray(current_screenshot)
                 timestamp = int(time.time())
-                filename = f"{timestamp}_{i}.webp" # Add monitor index to filename for uniqueness
+                filename = f"{timestamp}_{monitor_index}.webp"
                 filepath = os.path.join(screenshots_path, filename)
                 image.save(
                     filepath,
                     format="webp",
                     lossless=True,
                 )
+
+                # Extract text and create embedding
                 text: str = extract_text_from_image(current_screenshot)
+
                 # Only proceed if OCR actually extracts text
                 if text.strip():
                     embedding: np.ndarray = get_embedding(text)
                     active_app_name: str = get_active_app_name() or "Unknown App"
                     active_window_title: str = get_active_window_title() or "Unknown Title"
+
+                    # Insert entry with monitor information
                     insert_entry(
-                        text, timestamp, embedding, active_app_name, active_window_title, filename # Pass filename
+                        text=text,
+                        timestamp=timestamp,
+                        embedding=embedding,
+                        app=active_app_name,
+                        title=active_window_title,
+                        monitor_id=monitor_index,
+                        monitor_name=monitor_name
                     )
 
-        time.sleep(3) # Wait before taking the next screenshot
-
-    return screenshots
-
-
-def record_screenshots_thread():
-    # TODO: fix the error from huggingface tokenizers
-    import os
-
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    last_screenshots = take_screenshots()
-
-    while True:
-        if not is_user_active():
-            time.sleep(3)
-            continue
-
-        screenshots = take_screenshots()
-
-        for i, screenshot in enumerate(screenshots):
-
-            last_screenshot = last_screenshots[i]
-
-            if not is_similar(screenshot, last_screenshot):
-                last_screenshots[i] = screenshot
-                image = Image.fromarray(screenshot)
-                timestamp = int(time.time())
-                image.save(
-                    os.path.join(screenshots_path, f"{timestamp}.webp"),
-                    format="webp",
-                    lossless=True,
-                )
-                text: str = extract_text_from_image(current_screenshot)
-                # Only proceed if OCR actually extracts text
-                if text.strip():
-                    embedding: np.ndarray = get_embedding(text)
-                    active_app_name: str = get_active_app_name() or "Unknown App"
-                    active_window_title: str = get_active_window_title() or "Unknown Title"
-                    insert_entry(
-                        text, timestamp, embedding, active_app_name, active_window_title, filename # Pass filename
-                    )
-
-        time.sleep(3) # Wait before taking the next screenshot
+        time.sleep(3)  # Wait before taking the next screenshot
